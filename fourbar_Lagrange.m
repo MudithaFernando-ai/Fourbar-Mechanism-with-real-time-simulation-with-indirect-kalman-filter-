@@ -1,11 +1,11 @@
-%% Fourbar_9DOF_Animation.m
-% MATLAB fourbar mechanism simulation with animation (no TCP/IP)
+% MATLAB fourbar mechanism simulation  (no TCP/IP)
 clear; clc; close all;
 
 %% Parameters
 g  = 8;
 L1 = 2.0;  L2 = 8.0;  L3 = 5.0;  L4 = 10.2;
 m1 = 2.0;  m2 = 8.0;  m3 = 5.0;
+
 rodInertia = @(m,L) m*L^2/12;
 
 params.g = g;
@@ -17,7 +17,6 @@ params.I3=rodInertia(m3,L3);
 params.T0=0.0;
 params.win=2*pi*0.02;
 
-
 %% Time
 dt   = 0.001;
 tend = 10.0;
@@ -27,6 +26,7 @@ N    = numel(tsol);
 %% TCP/IP CONFIGURATION
 serverIP = "169.254.131.136";  %  C++ server IP
 serverPort = 5556;             % server port
+
 %% CONNECT TO C++ SERVER
 try
     tcpipClient = tcpip(serverIP, serverPort, 'NetworkRole', 'client');
@@ -58,9 +58,28 @@ x0  = [q0; dq0];
 xsol = zeros(N,18);
 xsol(1,:) = x0';
 
+%% --- Logging for "show" each 0.001 s transfer ---
+theta_log = zeros(N,1);
+omega_log = zeros(N,1);
+alpha_log = zeros(N,1);
+wall_log  = zeros(N,1);   % wall-clock time at each transfer
+txdt_log  = zeros(N,1);   % wall-clock interval between transfers
+
+% initial values
+theta_log(1) = x0(3);
+omega_log(1) = x0(12);
+dx0 = fourbarode_lagrange(tsol(1), x0, params);
+alpha_log(1) = dx0(12);   % ddq(3)
+wall_log(1)  = 0;
+txdt_log(1)  = 0;
+
+showEveryStep = true;     % prints every 0.001 s (will slow MATLAB a lot)
+printStride   = 1;        % keep 1 to print every step, or set 10/100 to reduce
 
 %% Main loop (RK4 integration + TCP transmission)
-tic;  % For real-time pacing
+tic;                 % For wall-clock timing
+prevWall = toc;
+
 for k = 1:N-1
     t = tsol(k);
     x = xsol(k,:)';
@@ -71,25 +90,42 @@ for k = 1:N-1
     k3 = fourbarode_lagrange(t+dt/2.0, x+dt/2.0*k2,  params);
     k4 = fourbarode_lagrange(t+dt,     x+dt*k3,      params);
     x_next = x + dt/6.0*(k1 + 2*k2 + 2*k3 + k4);
-    
-    % Extract current theta1, omega1
-    th1_current = x_next(3);    % q(3)
-    omega1_current = x_next(12); % dq(3)
 
     xsol(k+1,:) = x_next';
-        
+
+    % Extract theta, omega
+    theta_current = x_next(3);    % q(3)
+    omega_current = x_next(12);   % dq(3)
+
+    % Compute alpha from EOM at the (t+dt, x_next) point
+    dxdt_next = fourbarode_lagrange(t+dt, x_next, params);
+    alpha_current = dxdt_next(12); % ddq(3) (since dxdt(10:18)=ddq)
+
+    % Log (this is the "show each 0.001 s interval" data)
+    theta_log(k+1) = theta_current;
+    omega_log(k+1) = omega_current;
+    alpha_log(k+1) = alpha_current;
+
+    nowWall = toc;
+    wall_log(k+1) = nowWall;
+    txdt_log(k+1) = nowWall - prevWall;
+    prevWall = nowWall;
+
     % ===============================================
-    % STEP 8: TCP TRANSMISSION (send angle & angular velocity)
+    % STEP 8: TCP TRANSMISSION (send theta, omega, alpha)
     % ===============================================
-    theta_current = x_next(3);
-    omega_current = x_next(12);
-    
     try
-        fwrite(tcpipClient, theta_current, 'double');
-        fwrite(tcpipClient, omega_current, 'double');
+        % Send as 3 doubles in one write (24 bytes total)
+        fwrite(tcpipClient, [theta_current; omega_current; alpha_current], 'double');
     catch
         fprintf('\n TCP transmission error\n');
         break;
+    end
+
+    % Optional console display every step (or every "printStride" steps)
+    if showEveryStep && (mod(k,printStride)==0)
+        fprintf('t=%.3f  theta=%.6f  omega=%.6f  alpha=%.6f  tx_dt=%.6f s\n', ...
+            t+dt, theta_current, omega_current, alpha_current, txdt_log(k+1));
     end
 end
 
@@ -100,11 +136,24 @@ try
 catch
 end
 
-%% ===================== functions =====================
+%% Plot results (theta, omega, alpha vs simulation time)
+figure('Name','Fourbar TX signals');
+subplot(3,1,1); plot(tsol, theta_log, 'LineWidth', 1.2); grid on;
+ylabel('\theta_1 (rad)');
+subplot(3,1,2); plot(tsol, omega_log, 'LineWidth', 1.2); grid on;
+ylabel('\omega_1 (rad/s)');
+subplot(3,1,3); plot(tsol, alpha_log, 'LineWidth', 1.2); grid on;
+ylabel('\alpha_1 (rad/s^2)'); xlabel('t (s)');
 
+figure('Name','Wall-clock transfer interval');
+plot(tsol, txdt_log, 'LineWidth', 1.2); grid on;
+xlabel('t (s)'); ylabel('Transfer interval (s)');
+
+%% ===================== functions =====================
 function dxdt = fourbarode_lagrange(t, x, p)
     q  = x(1:9);
     dq = x(10:18);
+
     M  = fourbarM(p);
     Cq = fourbarCq(q, p);
     Qe = fourbarQe(t, p);
@@ -113,6 +162,7 @@ function dxdt = fourbarode_lagrange(t, x, p)
     eps = 1e-6;
     nC  = size(Cq,1);
     nQ  = numel(q);
+
     dCdqdq = zeros(nC, nQ);
     for j = 1:nQ
         qp = q; qm = q;
@@ -122,10 +172,12 @@ function dxdt = fourbarode_lagrange(t, x, p)
         Cqm = fourbarCq(qm, p);
         dCdqdq(:,j) = (Cqp*dq - Cqm*dq)/(2*eps);
     end
+
     gamma = -dCdqdq * dq;
 
     A = [M, Cq';
          Cq, zeros(nC,nC)];
+
     rhs = [Qe + Qv;
            gamma];
 
@@ -149,6 +201,7 @@ function Qe = fourbarQe(t, p)
     Qe(2) = -p.m1*p.g;
     Qe(5) = -p.m2*p.g;
     Qe(8) = -p.m3*p.g;
+
     Qe(3) = Qe(3) + p.T0*sin(p.win*t);
     Qe(3) = Qe(3);
 end
@@ -156,9 +209,11 @@ end
 function Cq = fourbarCq(q, p)
     th1=q(3); th2=q(6); th3=q(9);
     L1=p.L1; L2=p.L2; L3=p.L3;
+
     s1=sin(th1); c1=cos(th1);
     s2=sin(th2); c2=cos(th2);
     s3=sin(th3); c3=cos(th3);
+
     Cq = zeros(8,9);
     Cq(1,1)=1;      Cq(1,3)= (L1/2)*s1;
     Cq(2,2)=1;      Cq(2,3)= -(L1/2)*c1;
@@ -173,23 +228,31 @@ end
 function [B, C, th2, th3] = closure_from_th1(th1, p)
     A = [0;0];
     D = [p.L4; 0];
+
     B = A + [p.L1*cos(th1); p.L1*sin(th1)];
     d = norm(D - B);
+
     if d > (p.L2 + p.L3) || d < abs(p.L2 - p.L3)
         error('No real closure');
     end
+
     ex = (D - B)/d;
     ey = [-ex(2); ex(1)];
+
     a = (p.L2^2 - p.L3^2 + d^2)/(2*d);
     h = sqrt(max(p.L2^2 - a^2, 0));
+
     P2 = B + a*ex;
+
     C1 = P2 + h*ey;
     C2 = P2 - h*ey;
+
     if C1(2) >= C2(2)
         C = C1;
     else
         C = C2;
     end
+
     th2 = atan2(C(2) - B(2), C(1) - B(1));
     th3 = atan2(C(2) - D(2), C(1) - D(1));
 end
@@ -199,16 +262,16 @@ function [rA, rB, rC, rD] = joints_from_q(q, p)
     Rx1 = q(1); Ry1 = q(2); th1 = q(3);
     Rx2 = q(4); Ry2 = q(5); th2 = q(6);
     Rx3 = q(7); Ry3 = q(8); th3 = q(9);
-    
+
     % Joint A (fixed origin)
     rA = [0; 0];
-    
+
     % Joint B (end of crank AB)
     rB = [Rx1 + (p.L1/2)*cos(th1); Ry1 + (p.L1/2)*sin(th1)];
-    
+
     % Joint C (end of coupler BC)
     rC = [Rx2 + (p.L2/2)*cos(th2); Ry2 + (p.L2/2)*sin(th2)];
-    
+
     % Joint D (fixed ground end)
     rD = [p.L4; 0];
 end

@@ -1,5 +1,4 @@
-%% Fourbar_9DOF_Animation.m
-% MATLAB fourbar mechanism simulation (no TCP/IP, with plots + animation)
+% MATLAB fourbar mechanism simulation (WITH TCP/IP)
 clear; clc; close all;
 
 %% Parameters
@@ -16,11 +15,34 @@ params.I3=rodInertia(m3,L3);
 params.T0=0.0;
 params.win=2*pi*0.02;
 
+%% ── NOISE PARAMETERS  ────────────────────────────────────────────
+rng(42);
+sigma_theta = 1e-3;   % measurement noise std – theta  (rad)
+sigma_omega = 5e-3;   % measurement noise std – omega  (rad/s)
+sigma_alpha = 1e-2;   % measurement noise std – alpha  (rad/s²)
+
 %% Time
 dt   = 0.001;
 tend = 10.0;
 tsol = 0:dt:tend;
 N    = numel(tsol);
+
+%% TCP/IP CONFIGURATION
+serverIP = "169.254.131.136";  %  C++ server IP
+serverPort = 5556;             % server port
+
+%% CONNECT TO C++ SERVER
+try
+    tcpipClient = tcpip(serverIP, serverPort, 'NetworkRole', 'client');
+    tcpipClient.InputBufferSize = 8192;
+    tcpipClient.OutputBufferSize = 8192;
+    tcpipClient.Timeout = 30;
+    fopen(tcpipClient);
+    fprintf(' Connected to C++ Augmented Lagrange server!\n\n');
+catch ME
+    fprintf(' Connection failed: %s\n', ME.message);
+    return;
+end
 
 %% Initial configuration (closure)
 th1_0 = pi/2;
@@ -37,11 +59,41 @@ x0  = [q0; dq0];
 xsol = zeros(N,18);
 xsol(1,:) = x0';
 
-%% Main loop (RK4 integration)
-tic;
+%% --- Logging for "show" each 0.001 s transfer ---
+theta_log = zeros(N,1);
+omega_log = zeros(N,1);
+alpha_log = zeros(N,1);
+
+theta_meas_log = zeros(N,1);   % (Added)
+omega_meas_log = zeros(N,1);   % (Added)
+alpha_meas_log = zeros(N,1);   % (Added)
+
+wall_log  = zeros(N,1);   % wall-clock time at each transfer
+txdt_log  = zeros(N,1);   % wall-clock interval between transfers
+
+% initial values (True)
+theta_log(1) = x0(3);
+omega_log(1) = x0(12);
+dx0 = fourbarode_lagrange(tsol(1), x0, params);
+alpha_log(1) = dx0(12);   % ddq(3)
+
+% initial values (Noisy)
+theta_meas_log(1) = theta_log(1) + sigma_theta*randn();
+omega_meas_log(1) = omega_log(1) + sigma_omega*randn();
+alpha_meas_log(1) = alpha_log(1) + sigma_alpha*randn();
+
+wall_log(1)  = 0;
+txdt_log(1)  = 0;
+showEveryStep = true;     % prints every 0.001 s (will slow MATLAB a lot)
+printStride   = 1;        % keep 1 to print every step, or set 10/100 to reduce
+
+%% Main loop (RK4 integration + TCP transmission)
+tic;                 % For wall-clock timing
+prevWall = toc;
 for k = 1:N-1
     t = tsol(k);
     x = xsol(k,:)';
+    
     % Integrate one step RK4
     k1 = fourbarode_lagrange(t,        x,            params);
     k2 = fourbarode_lagrange(t+dt/2.0, x+dt/2.0*k1,  params);
@@ -49,75 +101,81 @@ for k = 1:N-1
     k4 = fourbarode_lagrange(t+dt,     x+dt*k3,      params);
     x_next = x + dt/6.0*(k1 + 2*k2 + 2*k3 + k4);
     xsol(k+1,:) = x_next';
+    
+    % Extract TRUE theta, omega, alpha
+    theta_true = x_next(3);    % q(3)
+    omega_true = x_next(12);   % dq(3)
+    dxdt_next = fourbarode_lagrange(t+dt, x_next, params);
+    alpha_true = dxdt_next(12); % ddq(3) 
+
+    % Add NOISE to create the measured signals to be sent
+    theta_current = theta_true + sigma_theta*randn();
+    omega_current = omega_true + sigma_omega*randn();
+    alpha_current = alpha_true + sigma_alpha*randn();
+    
+    % Log both
+    theta_log(k+1) = theta_true;
+    omega_log(k+1) = omega_true;
+    alpha_log(k+1) = alpha_true;
+
+    theta_meas_log(k+1) = theta_current;
+    omega_meas_log(k+1) = omega_current;
+    alpha_meas_log(k+1) = alpha_current;
+    
+    nowWall = toc;
+    wall_log(k+1) = nowWall;
+    txdt_log(k+1) = nowWall - prevWall;
+    prevWall = nowWall;
+    
+    % ===============================================
+    % STEP 8: TCP TRANSMISSION (send noisy theta, omega, alpha)
+    % ===============================================
+    try
+        % Send as 3 doubles in one write (24 bytes total)
+        fwrite(tcpipClient, [theta_current; omega_current; alpha_current], 'double');
+    catch
+        fprintf('\n TCP transmission error\n');
+        break;
+    end
+    
+    % Optional console display every step
+    if showEveryStep && (mod(k,printStride)==0)
+        fprintf('t=%.3f  theta=%.6f  omega=%.6f  alpha=%.6f  tx_dt=%.6f s\n', ...
+            t+dt, theta_current, omega_current, alpha_current, txdt_log(k+1));
+    end
 end
-toc;
 
-%% Plot theta1 and omega1
-figure('Name', 'Four-bar Crank Kinematics');
-subplot(2,1,1);
-plot(tsol, xsol(:,3), 'b-', 'LineWidth', 2);
-ylabel('$\theta_1$ (rad)');
-title('Crank Angle vs Time');
-grid on;
-
-subplot(2,1,2);
-plot(tsol, xsol(:,12), 'r-', 'LineWidth', 2);
-xlabel('Time (s)');
-ylabel('$\omega_1$ (rad/s)');
-title('Crank Angular Velocity vs Time');
-grid on;
-
-%% Animation (replay full simulation)
-figure('Name', 'Four-bar Mechanism Animation');
-fig = gcf;
-fig.Position = [100, 100, 1000, 600];
-
-% Precompute all joint positions for speed
-rA_all = zeros(2,N); rB_all = zeros(2,N); rC_all = zeros(2,N); rD_all = zeros(2,N);
-for k = 1:N
-    [rA, rB, rC, rD] = joints_from_q(xsol(k,1:9)', params);
-    rA_all(:,k) = rA; rB_all(:,k) = rB; rC_all(:,k) = rC; rD_all(:,k) = rD;
+%% CLEANUP
+try
+    fclose(tcpipClient);
+    delete(tcpipClient);
+catch
 end
 
-hAB = plot(NaN, NaN, 'b-', 'LineWidth', 4); hold on;
-hBC = plot(NaN, NaN, 'g-', 'LineWidth', 4);
-hCD = plot(NaN, NaN, 'r-', 'LineWidth', 4);
-hGround = plot([0 L4], [0 0], 'k-', 'LineWidth', 6);
-scatter([0 L4], [0 0], 200, 'ko', 'filled'); % Fixed joints A,D
-hJoints = scatter(NaN, NaN, 150, 'k', 'filled'); % Moving joints B,C
-hCoM1 = scatter(NaN, NaN, 100, 'b', 'filled'); % Crank CoM
-hCoM2 = scatter(NaN, NaN, 100, 'g', 'filled'); % Coupler CoM
-hCoM3 = scatter(NaN, NaN, 100, 'r', 'filled'); % Rocker CoM
-title('9-DOF Four-bar Animation (L1=2, L2=8, L3=5, L4=10.2)');
-xlabel('X (m)'); ylabel('Y (m)');
-axis equal; grid on; xlim([-1 12]); ylim([-6 6]);
-legend([hAB hBC hCD hGround], {'Crank AB', 'Coupler BC', 'Rocker CD', 'Ground'}, 'Location', 'best');
+%% Plot results (theta, omega, alpha vs simulation time)
+figure('Name','Fourbar TX signals (True vs Noisy)');
 
-% Animate at 50 FPS (20ms/frame)
-for k = 1:10:N  % Every 10th frame for smooth playback
-    % Update links
-    set(hAB, 'XData', [rA_all(1,k) rB_all(1,k)], 'YData', [rA_all(2,k) rB_all(2,k)]);
-    set(hBC, 'XData', [rB_all(1,k) rC_all(1,k)], 'YData', [rB_all(2,k) rC_all(2,k)]);
-    set(hCD, 'XData', [rC_all(1,k) rD_all(1,k)], 'YData', [rC_all(2,k) rD_all(2,k)]);
-    
-    % Update joints B,C
-    set(hJoints, 'XData', [rB_all(1,k) rC_all(1,k)], 'YData', [rB_all(2,k) rC_all(2,k)]);
-    
-    % Update CoM positions
-    com1 = [xsol(k,1); xsol(k,2)];
-    com2 = [xsol(k,4); xsol(k,5)];
-    com3 = [xsol(k,7); xsol(k,8)];
-    set(hCoM1, 'XData', com1(1), 'YData', com1(2));
-    set(hCoM2, 'XData', com2(1), 'YData', com2(2));
-    set(hCoM3, 'XData', com3(1), 'YData', com3(2));
-    
-    % Status text
-    text(0.02, 5.5, sprintf('t=%.2fs | θ₁=%.2f rad (%.1f°)', tsol(k), xsol(k,3), rad2deg(xsol(k,3))), ...
-         'FontSize', 12, 'BackgroundColor', 'w');
-    
-    drawnow limitrate nocallbacks;
-    pause(0.02);  % 50 FPS
-end
+subplot(3,1,1); 
+plot(tsol, theta_log, 'b', 'LineWidth', 1.4); hold on;
+plot(tsol, theta_meas_log, 'r', 'LineWidth', 0.8);
+grid on; ylabel('\theta_1 (rad)'); title('\theta_1 (True vs Measured)');
+legend('True', 'Measured', 'Location','best');
+
+subplot(3,1,2); 
+plot(tsol, omega_log, 'b', 'LineWidth', 1.4); hold on;
+plot(tsol, omega_meas_log, 'r', 'LineWidth', 0.8);
+grid on; ylabel('\omega_1 (rad/s)'); title('\omega_1 (True vs Measured)');
+legend('True', 'Measured', 'Location','best');
+
+subplot(3,1,3); 
+plot(tsol, alpha_log, 'b', 'LineWidth', 1.4); hold on;
+plot(tsol, alpha_meas_log, 'r', 'LineWidth', 0.8);
+grid on; ylabel('\alpha_1 (rad/s^2)'); xlabel('t (s)'); title('\alpha_1 (True vs Measured)');
+legend('True', 'Measured', 'Location','best');
+
+figure('Name','Wall-clock transfer interval');
+plot(tsol, txdt_log, 'LineWidth', 1.2); grid on;
+xlabel('t (s)'); ylabel('Transfer interval (s)');
 
 %% ===================== functions =====================
 function dxdt = fourbarode_lagrange(t, x, p)
@@ -164,6 +222,7 @@ function Qe = fourbarQe(t, p)
     Qe(5) = -p.m2*p.g;
     Qe(8) = -p.m3*p.g;
     Qe(3) = Qe(3) + p.T0*sin(p.win*t);
+    Qe(3) = Qe(3);
 end
 
 function Cq = fourbarCq(q, p)
@@ -208,20 +267,11 @@ function [B, C, th2, th3] = closure_from_th1(th1, p)
 end
 
 function [rA, rB, rC, rD] = joints_from_q(q, p)
-    % Extract positions and angles from state q
     Rx1 = q(1); Ry1 = q(2); th1 = q(3);
     Rx2 = q(4); Ry2 = q(5); th2 = q(6);
     Rx3 = q(7); Ry3 = q(8); th3 = q(9);
-    
-    % Joint A (fixed origin)
     rA = [0; 0];
-    
-    % Joint B (end of crank AB)
     rB = [Rx1 + (p.L1/2)*cos(th1); Ry1 + (p.L1/2)*sin(th1)];
-    
-    % Joint C (end of coupler BC)
     rC = [Rx2 + (p.L2/2)*cos(th2); Ry2 + (p.L2/2)*sin(th2)];
-    
-    % Joint D (fixed ground end)
     rD = [p.L4; 0];
 end
